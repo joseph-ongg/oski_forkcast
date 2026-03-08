@@ -12,7 +12,9 @@ import {
 } from '@/lib/storage';
 import { pushToCloud, syncWithCloud } from '@/lib/sync';
 import Link from 'next/link';
-import { ArrowLeft, SkipForward, Check, Star, Filter, X, ChevronLeft, Layers, CalendarRange } from 'lucide-react';
+import { ArrowLeft, SkipForward, Check, Star, Filter, X, ChevronLeft, Layers, CalendarRange, Sparkles } from 'lucide-react';
+import { predict } from '@/lib/prediction';
+import { Prediction } from '@/lib/types';
 import { useSearchParams } from 'next/navigation';
 
 function formatDate(date: Date): string {
@@ -194,6 +196,24 @@ function RatePageContent() {
   const totalUnrated = unratedItems.length;
   const totalItems = allItems.length;
   const ratedCount = totalItems - totalUnrated;
+
+  // Predict rating for current dish
+  const currentPrediction: Prediction | null = useMemo(() => {
+    if (!currentItem) return null;
+    const allDishNames = [...allItems.map((i) => i.name), ...Object.keys(rankings)];
+    const dishCategories: Record<string, string> = {};
+    for (const item of allItems) {
+      if (item.categories.length > 0) {
+        dishCategories[item.name] = item.categories[0];
+      }
+    }
+    return predict(
+      { name: currentItem.name, category: currentItem.categories[0] },
+      rankings,
+      allDishNames,
+      dishCategories
+    );
+  }, [currentItem, rankings, allItems]);
 
   const handleRate = useCallback(
     (rating: number) => {
@@ -422,6 +442,59 @@ function RatePageContent() {
               <p className="text-sm text-slate-400">{currentItem.description}</p>
             )}
           </div>
+
+          {/* Prediction */}
+          {currentPrediction && currentPrediction.confidence >= 0.5 && (
+            <div className={`border-t border-slate-800 px-6 py-4 ${
+              currentPrediction.predictedSkip ? 'bg-red-900/10' : 'bg-purple-900/10'
+            }`}>
+              <div className="flex items-center justify-between">
+                <div className="flex items-center gap-2">
+                  <Sparkles className={`w-4 h-4 ${currentPrediction.predictedSkip ? 'text-red-400' : 'text-purple-400'}`} />
+                  <span className={`text-sm ${currentPrediction.predictedSkip ? 'text-red-300' : 'text-purple-300'}`}>
+                    {currentPrediction.predictedSkip ? (
+                      <>Predicted: <span className="font-bold text-red-200">Skip</span></>
+                    ) : (
+                      <>Predicted: <span className="font-bold text-purple-200">{currentPrediction.rating}</span></>
+                    )}
+                  </span>
+                  <span className={`text-xs ${currentPrediction.predictedSkip ? 'text-red-400/60' : 'text-purple-400/60'}`}>
+                    ({Math.round(currentPrediction.confidence * 100)}%)
+                  </span>
+                </div>
+                <button
+                  onClick={() => currentPrediction.predictedSkip ? handleSkip() : handleRate(currentPrediction.rating)}
+                  className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-sm font-medium transition-colors ${
+                    currentPrediction.predictedSkip
+                      ? 'bg-red-600/30 border border-red-500/40 text-red-200 hover:bg-red-600/50'
+                      : 'bg-purple-600/30 border border-purple-500/40 text-purple-200 hover:bg-purple-600/50'
+                  }`}
+                >
+                  {currentPrediction.predictedSkip ? (
+                    <><SkipForward className="w-3.5 h-3.5" /> Skip</>
+                  ) : (
+                    <><Check className="w-3.5 h-3.5" /> Accept</>
+                  )}
+                </button>
+              </div>
+              {currentPrediction.similarDishes.length > 0 && (
+                <div className="flex flex-wrap gap-1 mt-2">
+                  {currentPrediction.similarDishes.slice(0, 3).map((d) => (
+                    <span
+                      key={d.name}
+                      className={`text-xs px-2 py-0.5 rounded ${
+                        currentPrediction.predictedSkip
+                          ? 'bg-red-900/30 text-red-300/70'
+                          : 'bg-purple-900/30 text-purple-300/70'
+                      }`}
+                    >
+                      {d.name} ({d.rating === -1 ? 'skip' : d.rating})
+                    </span>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
 
           {/* Rating input */}
           <div className="border-t border-slate-800 p-6">

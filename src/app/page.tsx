@@ -3,7 +3,7 @@
 import { useState, useEffect, useCallback, useMemo } from 'react';
 import { useAuth } from './providers';
 import { MenuData, Rankings, HallResult } from '@/lib/types';
-import { calculateHallScore, getCurrentMealPeriod, resolveActivePeriod } from '@/lib/scoring';
+import { calculateHallScore, getCurrentMealPeriod, resolveActivePeriod, getEarlierMealItems } from '@/lib/scoring';
 import { loadRankings, loadIgnoredCategories } from '@/lib/storage';
 import { syncWithCloud } from '@/lib/sync';
 import UserMenu from '@/components/UserMenu';
@@ -98,7 +98,8 @@ function computeResults(
   for (const menu of menus) {
     const activePeriod = resolveActivePeriod(menu, mealPeriod);
     if (!activePeriod) continue;
-    const score = calculateHallScore(menu, rankings, activePeriod, ignored);
+    const earlierItems = getEarlierMealItems(menu, activePeriod);
+    const score = calculateHallScore(menu, rankings, activePeriod, ignored, earlierItems);
     results.push({ location: menu.location, score, activePeriod });
   }
   results.sort((a, b) => b.score.total_score - a.score.total_score);
@@ -438,7 +439,7 @@ export default function DashboardPage() {
               {unratedMealCount} unrated dish{unratedMealCount !== 1 ? 'es' : ''} for {mealPeriod}
             </p>
             <p className="text-amber-400/70 text-xs mt-0.5">
-              Recommendations may be inaccurate with missing ratings
+              Rate them for accurate scores — predictions can speed things up
             </p>
           </div>
           <Link

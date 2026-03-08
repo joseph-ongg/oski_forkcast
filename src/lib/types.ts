@@ -35,3 +35,10 @@ export interface HallResult {
 }
 
 export type Rankings = Record<string, number>;
+
+export interface Prediction {
+  rating: number; // -1 means predicted skip
+  confidence: number;
+  similarDishes: { name: string; rating: number; similarity: number }[];
+  predictedSkip: boolean;
+}
