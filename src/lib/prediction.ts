@@ -185,7 +185,7 @@ const FOOD_TYPE_WORDS = new Set([
   'cheese', 'cheddar', 'mozzarella', 'parmesan', 'feta', 'queso',
 ]);
 
-const FOOD_TYPE_WEIGHT = 3.0;    // food identity keywords (salmon, chicken, soup)
+const FOOD_TYPE_WEIGHT = 5.0;    // food identity keywords (salmon, chicken, soup)
 const COOKING_METHOD_WEIGHT = 0.3; // cooking method keywords (baked, fried, grilled)
 const OTHER_KEYWORD_WEIGHT = 1.0;  // everything else
 const TAXONOMY_WEIGHT = 0.3;
@@ -294,6 +294,10 @@ export function similarity(
   const totalMax = maxPossible + taxonomyMax + categoryMax;
 
   if (totalMax === 0) return 0;
+
+  // Vegan and non-vegan are separate worlds — no cross-matching
+  if (veganMismatch) return 0;
+
   return totalScore / totalMax;
 }
 
@@ -309,9 +313,7 @@ function isProteinGroup(group: string): boolean {
 
 const TOP_K = 5;
 const MIN_SIMILARITY = 0.01;
-const SKIP_SCORE = 0; // internal score for skipped dishes in weighted average
 const CATEGORY_SKIP_THRESHOLD = 0.5; // if 50%+ of a category's dishes are skipped, boost skip signal
-const CATEGORY_SKIP_WEIGHT = 0.4; // how strongly category skip ratio influences prediction
 
 export interface DishContext {
   name: string;
@@ -349,52 +351,115 @@ function getCategorySkipRatios(
   return ratios;
 }
 
+/**
+ * Build prediction using separate positive and skip neighbor pools.
+ *
+ * Positive pool → "what rating would this be IF you eat it?"
+ * Skip pool → "would you even eat this?"
+ *
+ * Positive matches always get priority for the rating.
+ * Skips only win when there are no strong positive neighbors.
+ */
 function buildPrediction(
   scored: { name: string; rating: number; sim: number }[],
   categorySkipRatio: number
 ): Prediction | null {
   if (scored.length === 0) return null;
 
-  scored.sort((a, b) => b.sim - a.sim);
-  const topK = scored.slice(0, TOP_K);
+  // Split into positive and skip pools
+  const positiveScored = scored.filter((s) => s.rating > 0);
+  const skipScored = scored.filter((s) => s.rating === -1);
 
-  // Weighted average rating — skips are treated as SKIP_SCORE (0)
-  let totalWeight = 0;
-  let weightedSum = 0;
-  let skipCount = 0;
-  for (const s of topK) {
-    totalWeight += s.sim;
-    const effectiveRating = s.rating === -1 ? SKIP_SCORE : s.rating;
-    weightedSum += s.sim * effectiveRating;
-    if (s.rating === -1) skipCount++;
+  // Sort each pool by similarity descending
+  positiveScored.sort((a, b) => b.sim - a.sim);
+  skipScored.sort((a, b) => b.sim - a.sim);
+
+  const topPositive = positiveScored.slice(0, TOP_K);
+  const topSkip = skipScored.slice(0, TOP_K);
+
+  // Compute positive prediction (weighted average of positive neighbors)
+  let predictedRating = 0;
+  let hasPositiveSignal = false;
+  if (topPositive.length > 0) {
+    let totalWeight = 0;
+    let weightedSum = 0;
+    for (const s of topPositive) {
+      totalWeight += s.sim;
+      weightedSum += s.sim * s.rating;
+    }
+    predictedRating = weightedSum / totalWeight;
+    hasPositiveSignal = true;
   }
 
-  let predictedRating = weightedSum / totalWeight;
+  // Compute skip signal strength
+  // How strongly do skip neighbors suggest this should be skipped?
+  let skipSignal = 0;
+  if (topSkip.length > 0) {
+    // Skip signal based on: how many skip neighbors, how similar they are
+    const bestSkipSim = topSkip[0].sim;
+    const skipCountFactor = Math.min(topSkip.length / 3, 1);
+    skipSignal = bestSkipSim * 0.6 + skipCountFactor * 0.4;
 
-  // Factor in category skip ratio: if most dishes in this category are skipped,
-  // push prediction toward skip
-  if (categorySkipRatio >= CATEGORY_SKIP_THRESHOLD) {
-    const skipPull = categorySkipRatio * CATEGORY_SKIP_WEIGHT;
-    predictedRating = predictedRating * (1 - skipPull);
+    // Boost with category skip ratio
+    if (categorySkipRatio >= CATEGORY_SKIP_THRESHOLD) {
+      skipSignal = Math.max(skipSignal, categorySkipRatio * 0.8);
+    }
+  } else if (categorySkipRatio >= CATEGORY_SKIP_THRESHOLD) {
+    skipSignal = categorySkipRatio * 0.6;
   }
+
+  // Determine if positive signal is strong enough to override skips
+  let positiveSignalStrength = 0;
+  if (topPositive.length > 0) {
+    const bestPosSim = topPositive[0].sim;
+    const posCountFactor = Math.min(topPositive.length / 2, 1);
+    positiveSignalStrength = bestPosSim * 0.7 + posCountFactor * 0.3;
+  }
+
+  // Decision: predict skip when skip signal dominates positive signal
+  // Compare the QUALITY of matches: if skip neighbors are much more similar
+  // than positive ones, the positive matches are irrelevant noise
+  const bestPosSim = topPositive.length > 0 ? topPositive[0].sim : 0;
+  const bestSkipSim = topSkip.length > 0 ? topSkip[0].sim : 0;
+
+  let predictedSkip: boolean;
+  if (!hasPositiveSignal) {
+    // No positive neighbors at all → skip if any skip signal
+    predictedSkip = skipSignal >= 0.3;
+  } else if (bestSkipSim > bestPosSim * 3) {
+    // Skip neighbors are WAY more similar than positive ones
+    // e.g., "Roasted Carrots" matches skipped carrots (sim=0.8) vs "Roasted Pork" (sim=0.05)
+    predictedSkip = true;
+  } else {
+    // Both pools have comparable matches — only skip if positive signal is very weak
+    predictedSkip = positiveSignalStrength < 0.15 && skipSignal >= 0.5;
+  }
+
+  // Build the combined similar dishes list for display
+  // Show the most relevant neighbors from whichever pool drove the decision
+  let displayNeighbors: { name: string; rating: number; sim: number }[];
+  if (predictedSkip) {
+    displayNeighbors = [...topSkip.slice(0, 3), ...topPositive.slice(0, 2)];
+  } else {
+    displayNeighbors = [...topPositive.slice(0, 3), ...topSkip.slice(0, 2)];
+  }
+  displayNeighbors.sort((a, b) => b.sim - a.sim);
+  displayNeighbors = displayNeighbors.slice(0, TOP_K);
 
   // Confidence
-  const bestSim = topK[0].sim;
-  const countFactor = Math.min(topK.length / 3, 1);
-  let confidence = bestSim * 0.7 + countFactor * 0.3;
-
-  // Boost confidence for skip prediction if most neighbors are skips
-  const skipRatio = skipCount / topK.length;
-  if (skipRatio >= 0.5) {
-    confidence = Math.max(confidence, skipRatio * 0.8);
+  let confidence: number;
+  if (predictedSkip) {
+    confidence = skipSignal;
+  } else if (hasPositiveSignal) {
+    confidence = positiveSignalStrength;
+  } else {
+    confidence = 0;
   }
-
-  const predictedSkip = predictedRating <= 1 && (skipRatio >= 0.4 || categorySkipRatio >= CATEGORY_SKIP_THRESHOLD);
 
   return {
     rating: predictedSkip ? -1 : Math.max(1, Math.round(predictedRating * 2) / 2),
     confidence: Math.min(confidence, 1),
-    similarDishes: topK.map((s) => ({
+    similarDishes: displayNeighbors.map((s) => ({
       name: s.name,
       rating: s.rating,
       similarity: Math.round(s.sim * 100) / 100,
