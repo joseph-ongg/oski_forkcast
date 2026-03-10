@@ -3,6 +3,12 @@ export interface MenuItem {
   category: string;
   description: string;
   allergens: string[];
+  dietaryChoices: string[];
+}
+
+export interface DietaryPreferences {
+  diets: string[];      // e.g. ["Vegan Option", "Halal"] — require presence
+  allergens: string[];  // e.g. ["Peanut", "Milk"] — require absence
 }
 
 export interface MealData {

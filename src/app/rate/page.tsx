@@ -2,18 +2,21 @@
 
 import { Suspense, useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import { useAuth } from '@/app/providers';
-import { MenuData, MenuItem, Rankings } from '@/lib/types';
+import { MenuData, MenuItem, Rankings, DietaryPreferences } from '@/lib/types';
 import { getCurrentMealPeriod, resolveActivePeriod } from '@/lib/scoring';
 import {
   loadRankings,
   saveRankings,
   loadIgnoredCategories,
   saveIgnoredCategories,
+  loadDietaryPreferences,
+  saveDietaryPreferences,
 } from '@/lib/storage';
+import { shouldExcludeDish } from '@/lib/dietary';
 import { pushToCloud, syncWithCloud } from '@/lib/sync';
 import Link from 'next/link';
-import { ArrowLeft, SkipForward, Check, Star, Filter, X, ChevronLeft, Layers, CalendarRange, Sparkles } from 'lucide-react';
-import { predict } from '@/lib/prediction';
+import { ArrowLeft, SkipForward, Check, Star, Filter, X, ChevronLeft, Layers, CalendarRange, Sparkles, Search, Zap, Shield } from 'lucide-react';
+import { predict, tokenize } from '@/lib/prediction';
 import { Prediction } from '@/lib/types';
 import { useSearchParams } from 'next/navigation';
 
@@ -28,6 +31,8 @@ interface UniqueItem {
   name: string;
   description: string;
   categories: string[];
+  allergens: string[];
+  dietaryChoices: string[];
 }
 
 export default function RatePage() {
@@ -57,6 +62,14 @@ function RatePageContent() {
   const [weekLoading, setWeekLoading] = useState(false);
   const [history, setHistory] = useState<{ name: string; rating: number }[]>([]);
   const [lastAction, setLastAction] = useState<number | null>(null); // rating shown after going back
+  const [searchQuery, setSearchQuery] = useState('');
+  const [searchOpen, setSearchOpen] = useState(false);
+  const [autoSkipCondiments, setAutoSkipCondiments] = useState(false);
+  const [showDietary, setShowDietary] = useState(false);
+  const [dietaryPrefs, setDietaryPrefs] = useState<DietaryPreferences>({ diets: [], allergens: [] });
+  const [expandedSearchItem, setExpandedSearchItem] = useState<string | null>(null);
+  const [searchRatingInput, setSearchRatingInput] = useState('');
+  const searchInputRef = useRef<HTMLInputElement | null>(null);
   const syncTimer = useRef<NodeJS.Timeout | null>(null);
 
   // Debounced cloud sync — pushes to cloud 2s after last rating action
@@ -74,14 +87,17 @@ function RatePageContent() {
         .then(({ rankings: r, ignoredCategories: ic }) => {
           setRankings(r);
           setIgnoredCategories(ic);
+          setDietaryPrefs(loadDietaryPreferences());
         })
         .catch(() => {
           setRankings(loadRankings());
           setIgnoredCategories(loadIgnoredCategories());
+          setDietaryPrefs(loadDietaryPreferences());
         });
     } else {
       setRankings(loadRankings());
       setIgnoredCategories(loadIgnoredCategories());
+      setDietaryPrefs(loadDietaryPreferences());
     }
   }, [user]);
 
@@ -128,6 +144,25 @@ function RatePageContent() {
   }, []);
 
   // Collect all unique items — either current meal, all meals, or full week
+  // Collect all allergens and dietary labels seen in current menus
+  const { allAllergens, allDiets } = useMemo(() => {
+    const allergenSet = new Set<string>();
+    const dietSet = new Set<string>();
+    const sourceMenus = rateWeek ? weekMenus : menus;
+    for (const menu of sourceMenus) {
+      for (const period of Object.keys(menu.meals)) {
+        for (const item of menu.meals[period]) {
+          for (const a of item.allergens) allergenSet.add(a);
+          for (const d of item.dietaryChoices) dietSet.add(d);
+        }
+      }
+    }
+    return {
+      allAllergens: Array.from(allergenSet).sort(),
+      allDiets: Array.from(dietSet).sort(),
+    };
+  }, [menus, weekMenus, rateWeek]);
+
   const { allItems, allCategories } = useMemo(() => {
     const itemMap = new Map<string, UniqueItem>();
     const catSet = new Set<string>();
@@ -136,46 +171,45 @@ function RatePageContent() {
     const sourceMenus = rateWeek ? weekMenus : menus;
     const iterateAllPeriods = rateAll || rateWeek;
 
+    const addItem = (item: MenuItem) => {
+      catSet.add(item.category);
+      if (ignoredLower.has(item.category.toLowerCase())) return;
+      if (shouldExcludeDish(item, dietaryPrefs)) return;
+      const existing = itemMap.get(item.name);
+      if (existing) {
+        if (!existing.categories.includes(item.category)) {
+          existing.categories.push(item.category);
+        }
+        // Merge allergens/dietary — union of all occurrences
+        for (const a of item.allergens) {
+          if (!existing.allergens.includes(a)) existing.allergens.push(a);
+        }
+        for (const d of item.dietaryChoices) {
+          if (!existing.dietaryChoices.includes(d)) existing.dietaryChoices.push(d);
+        }
+      } else {
+        itemMap.set(item.name, {
+          name: item.name,
+          description: item.description,
+          categories: [item.category],
+          allergens: [...item.allergens],
+          dietaryChoices: [...item.dietaryChoices],
+        });
+      }
+    };
+
     for (const menu of sourceMenus) {
       if (iterateAllPeriods) {
         for (const period of Object.keys(menu.meals)) {
           for (const item of menu.meals[period]) {
-            catSet.add(item.category);
-            if (ignoredLower.has(item.category.toLowerCase())) continue;
-            const existing = itemMap.get(item.name);
-            if (existing) {
-              if (!existing.categories.includes(item.category)) {
-                existing.categories.push(item.category);
-              }
-            } else {
-              itemMap.set(item.name, {
-                name: item.name,
-                description: item.description,
-                categories: [item.category],
-              });
-            }
+            addItem(item);
           }
         }
       } else {
         const activePeriod = resolveActivePeriod(menu, mealParam);
         if (!activePeriod || !menu.meals[activePeriod]) continue;
-
         for (const item of menu.meals[activePeriod]) {
-          catSet.add(item.category);
-          if (ignoredLower.has(item.category.toLowerCase())) continue;
-
-          const existing = itemMap.get(item.name);
-          if (existing) {
-            if (!existing.categories.includes(item.category)) {
-              existing.categories.push(item.category);
-            }
-          } else {
-            itemMap.set(item.name, {
-              name: item.name,
-              description: item.description,
-              categories: [item.category],
-            });
-          }
+          addItem(item);
         }
       }
     }
@@ -184,7 +218,7 @@ function RatePageContent() {
       allItems: Array.from(itemMap.values()).sort((a, b) => a.name.localeCompare(b.name)),
       allCategories: Array.from(catSet).sort(),
     };
-  }, [menus, weekMenus, mealParam, ignoredCategories, rateAll, rateWeek]);
+  }, [menus, weekMenus, mealParam, ignoredCategories, rateAll, rateWeek, dietaryPrefs]);
 
   // Unrated items
   const unratedItems = useMemo(
@@ -214,6 +248,109 @@ function RatePageContent() {
       dishCategories
     );
   }, [currentItem, rankings, allItems]);
+
+  // Single-ingredient condiment/garnish detection
+  const isCondimentOrGarnish = useCallback((name: string): boolean => {
+    const tokens = tokenize(name);
+    if (tokens.length > 2) return false;
+    const CONDIMENT_WORDS = new Set([
+      'salt', 'pepper', 'ketchup', 'mustard', 'mayo', 'mayonnaise', 'sauce',
+      'soy', 'sriracha', 'tabasco', 'vinegar', 'oil', 'olive', 'butter',
+      'margarine', 'jam', 'jelly', 'honey', 'syrup', 'sugar', 'cream',
+      'dressing', 'ranch', 'relish', 'salsa', 'guacamole', 'hummus',
+      'basil', 'cilantro', 'parsley', 'mint', 'chive', 'chives', 'dill',
+      'oregano', 'thyme', 'rosemary', 'sage', 'tarragon', 'cumin',
+      'lemon', 'lime', 'croutons', 'crouton', 'tortilla', 'chips',
+      'sour', 'whipped', 'gravy', 'broth', 'stock',
+      'cheddar', 'mozzarella', 'parmesan', 'provolone', 'swiss',
+      'pickles', 'pickle', 'olives', 'jalapeno', 'jalapenos',
+      'onion', 'onions', 'garlic', 'ginger', 'scallion', 'scallions',
+      'peanut', 'almond', 'walnut', 'pecan', 'cashew',
+      'sprouts', 'sprinkles', 'granola', 'crumble',
+    ]);
+    // If all tokens are condiment words, it's a condiment
+    return tokens.length >= 1 && tokens.every(t => CONDIMENT_WORDS.has(t));
+  }, []);
+
+  // Auto-skip condiments when toggle is on
+  useEffect(() => {
+    if (!autoSkipCondiments || loading || weekLoading) return;
+    let changed = false;
+    const newRankings = { ...rankings };
+    for (const item of unratedItems) {
+      if (isCondimentOrGarnish(item.name)) {
+        newRankings[item.name] = -1;
+        changed = true;
+      }
+    }
+    if (changed) {
+      setRankings(newRankings);
+      saveRankings(newRankings);
+      scheduleCloudSync();
+    }
+  }, [autoSkipCondiments, unratedItems, loading, weekLoading]);
+
+  // Search results
+  const searchResults = useMemo(() => {
+    if (!searchQuery.trim()) return [];
+    const q = searchQuery.toLowerCase().trim();
+    return allItems.filter((item) => {
+      const inName = item.name.toLowerCase().includes(q);
+      const inCat = item.categories.some(c => c.toLowerCase().includes(q));
+      return inName || inCat;
+    });
+  }, [searchQuery, allItems]);
+
+  const unratedSearchResults = useMemo(
+    () => searchResults.filter((item) => !(item.name in rankings)),
+    [searchResults, rankings]
+  );
+
+  // Predictions for unrated search results
+  const searchPredictions = useMemo(() => {
+    const preds = new Map<string, Prediction>();
+    if (!searchQuery.trim()) return preds;
+    const allDishNames = [...allItems.map((i) => i.name), ...Object.keys(rankings)];
+    const dishCategories: Record<string, string> = {};
+    for (const item of allItems) {
+      if (item.categories.length > 0) dishCategories[item.name] = item.categories[0];
+    }
+    for (const item of unratedSearchResults) {
+      const pred = predict(
+        { name: item.name, category: item.categories[0] },
+        rankings,
+        allDishNames,
+        dishCategories
+      );
+      if (pred) preds.set(item.name, pred);
+    }
+    return preds;
+  }, [searchQuery, unratedSearchResults, rankings, allItems]);
+
+  // Mass skip all unrated search results
+  const handleMassSkip = useCallback(() => {
+    if (unratedSearchResults.length === 0) return;
+    const newRankings = { ...rankings };
+    for (const item of unratedSearchResults) {
+      newRankings[item.name] = -1;
+    }
+    setRankings(newRankings);
+    saveRankings(newRankings);
+    scheduleCloudSync();
+    setSearchQuery('');
+    setSearchOpen(false);
+  }, [unratedSearchResults, rankings, scheduleCloudSync]);
+
+  // Rate a specific search result
+  const handleSearchRate = useCallback(
+    (name: string, rating: number) => {
+      const newRankings = { ...rankings, [name]: rating };
+      setRankings(newRankings);
+      saveRankings(newRankings);
+      scheduleCloudSync();
+    },
+    [rankings, scheduleCloudSync]
+  );
 
   const handleRate = useCallback(
     (rating: number) => {
@@ -332,6 +469,46 @@ function RatePageContent() {
           <Layers className="w-4 h-4" />
         </button>
         <button
+          onClick={() => { setSearchOpen(!searchOpen); setSearchQuery(''); setTimeout(() => searchInputRef.current?.focus(), 100); }}
+          className={`w-9 h-9 flex items-center justify-center rounded-lg border transition-colors ${
+            searchOpen
+              ? 'bg-berkeley-gold text-berkeley-blue border-berkeley-gold'
+              : 'bg-[#111827] border-slate-800 text-slate-400 hover:border-slate-600'
+          }`}
+          title="Search & mass skip"
+        >
+          <Search className="w-4 h-4" />
+        </button>
+        <button
+          onClick={() => setAutoSkipCondiments(!autoSkipCondiments)}
+          className={`w-9 h-9 flex items-center justify-center rounded-lg border transition-colors ${
+            autoSkipCondiments
+              ? 'bg-berkeley-gold text-berkeley-blue border-berkeley-gold'
+              : 'bg-[#111827] border-slate-800 text-slate-400 hover:border-slate-600'
+          }`}
+          title={autoSkipCondiments ? 'Auto-skip condiments: ON' : 'Auto-skip condiments: OFF'}
+        >
+          <Zap className="w-4 h-4" />
+        </button>
+        <button
+          onClick={() => setShowDietary(!showDietary)}
+          className={`w-9 h-9 flex items-center justify-center rounded-lg border transition-colors relative ${
+            showDietary
+              ? 'bg-berkeley-gold text-berkeley-blue border-berkeley-gold'
+              : dietaryPrefs.diets.length + dietaryPrefs.allergens.length > 0
+              ? 'bg-green-900/50 border-green-500/50 text-green-400'
+              : 'bg-[#111827] border-slate-800 text-slate-400 hover:border-slate-600'
+          }`}
+          title="Dietary restrictions & allergen filters"
+        >
+          <Shield className="w-4 h-4" />
+          {dietaryPrefs.diets.length + dietaryPrefs.allergens.length > 0 && !showDietary && (
+            <span className="absolute -top-1 -right-1 w-4 h-4 bg-green-500 text-[10px] font-bold text-white rounded-full flex items-center justify-center">
+              {dietaryPrefs.diets.length + dietaryPrefs.allergens.length}
+            </span>
+          )}
+        </button>
+        <button
           onClick={() => setShowFilters(!showFilters)}
           className={`w-9 h-9 flex items-center justify-center rounded-lg border transition-colors ${
             showFilters
@@ -389,6 +566,229 @@ function RatePageContent() {
         </div>
       )}
 
+      {/* Dietary Restrictions Panel */}
+      {showDietary && (
+        <div className="bg-[#111827] rounded-lg p-4 mb-6 border border-slate-800">
+          <div className="flex items-center justify-between mb-3">
+            <h3 className="text-sm font-semibold text-slate-300">Dietary Restrictions</h3>
+            <button onClick={() => setShowDietary(false)}>
+              <X className="w-4 h-4 text-slate-500" />
+            </button>
+          </div>
+
+          {allDiets.length > 0 && (
+            <>
+              <p className="text-xs text-slate-500 mb-2">Dietary requirements (only show matching dishes)</p>
+              <div className="flex flex-wrap gap-2 mb-4">
+                {allDiets.map((diet) => {
+                  const active = dietaryPrefs.diets.includes(diet);
+                  return (
+                    <button
+                      key={diet}
+                      onClick={() => {
+                        const newDiets = active
+                          ? dietaryPrefs.diets.filter((d) => d !== diet)
+                          : [...dietaryPrefs.diets, diet];
+                        const newPrefs = { ...dietaryPrefs, diets: newDiets };
+                        setDietaryPrefs(newPrefs);
+                        saveDietaryPreferences(newPrefs);
+                        setCurrentIndex(0);
+                      }}
+                      className={`px-3 py-1.5 rounded-full text-xs font-medium transition-colors ${
+                        active
+                          ? 'bg-green-600/40 text-green-200 border border-green-500/50'
+                          : 'bg-slate-800 text-slate-400 border border-slate-700 hover:border-slate-500'
+                      }`}
+                    >
+                      {diet.replace(' Option', '')}
+                    </button>
+                  );
+                })}
+              </div>
+            </>
+          )}
+
+          {allAllergens.length > 0 && (
+            <>
+              <p className="text-xs text-slate-500 mb-2">Allergens to avoid (hide dishes containing these)</p>
+              <div className="flex flex-wrap gap-2">
+                {allAllergens.map((allergen) => {
+                  const active = dietaryPrefs.allergens.includes(allergen);
+                  return (
+                    <button
+                      key={allergen}
+                      onClick={() => {
+                        const newAllergens = active
+                          ? dietaryPrefs.allergens.filter((a) => a !== allergen)
+                          : [...dietaryPrefs.allergens, allergen];
+                        const newPrefs = { ...dietaryPrefs, allergens: newAllergens };
+                        setDietaryPrefs(newPrefs);
+                        saveDietaryPreferences(newPrefs);
+                        setCurrentIndex(0);
+                      }}
+                      className={`px-3 py-1.5 rounded-full text-xs font-medium transition-colors ${
+                        active
+                          ? 'bg-red-600/40 text-red-200 border border-red-500/50'
+                          : 'bg-slate-800 text-slate-400 border border-slate-700 hover:border-slate-500'
+                      }`}
+                    >
+                      {allergen}
+                    </button>
+                  );
+                })}
+              </div>
+            </>
+          )}
+
+          {allDiets.length === 0 && allAllergens.length === 0 && (
+            <p className="text-xs text-slate-500">No dietary or allergen data available in current menus.</p>
+          )}
+        </div>
+      )}
+
+      {/* Search Panel */}
+      {searchOpen && (
+        <div className="bg-[#111827] rounded-lg border border-slate-800 mb-6 overflow-hidden">
+          <div className="p-4">
+            <div className="flex items-center gap-2 mb-3">
+              <Search className="w-4 h-4 text-slate-500" />
+              <input
+                ref={searchInputRef}
+                type="text"
+                value={searchQuery}
+                onChange={(e) => setSearchQuery(e.target.value)}
+                placeholder="Search dishes (e.g. carrots, soup, pizza)..."
+                className="flex-1 bg-transparent text-white text-sm placeholder-slate-600 focus:outline-none"
+              />
+              <button onClick={() => { setSearchOpen(false); setSearchQuery(''); }}>
+                <X className="w-4 h-4 text-slate-500 hover:text-slate-300" />
+              </button>
+            </div>
+
+            {searchQuery.trim() && (
+              <>
+                <div className="flex items-center justify-between mb-2">
+                  <span className="text-xs text-slate-500">
+                    {searchResults.length} found · {unratedSearchResults.length} unrated
+                  </span>
+                  {unratedSearchResults.length > 0 && (
+                    <button
+                      onClick={handleMassSkip}
+                      className="flex items-center gap-1 px-3 py-1 rounded-lg text-xs font-medium bg-red-600/30 border border-red-500/40 text-red-200 hover:bg-red-600/50 transition-colors"
+                    >
+                      <SkipForward className="w-3 h-3" />
+                      Skip All {unratedSearchResults.length}
+                    </button>
+                  )}
+                </div>
+
+                <div className="max-h-80 overflow-y-auto space-y-1">
+                  {searchResults.map((item) => {
+                    const rated = item.name in rankings;
+                    const rating = rankings[item.name];
+                    const pred = searchPredictions.get(item.name);
+                    const isExpanded = expandedSearchItem === item.name;
+                    return (
+                      <div key={item.name} className={`rounded-lg text-sm ${
+                        rated ? 'bg-slate-800/30 text-slate-500' : 'bg-[#0a0f1a] text-white'
+                      }`}>
+                        <div className="flex items-center justify-between px-3 py-2">
+                          <div className="flex-1 min-w-0 mr-2">
+                            <span className="truncate block">{item.name}</span>
+                            <div className="flex items-center gap-2">
+                              <span className="text-xs text-slate-600">{item.categories.join(', ')}</span>
+                              {!rated && pred && pred.confidence >= 0.5 && (
+                                <span className={`text-xs ${pred.predictedSkip ? 'text-red-400' : 'text-purple-400'}`}>
+                                  {pred.predictedSkip ? 'skip' : `~${pred.rating}`}
+                                </span>
+                              )}
+                            </div>
+                          </div>
+                          {rated && !isExpanded ? (
+                            <div className="flex items-center gap-1 shrink-0">
+                              <span className="text-xs">{rating === -1 ? 'skipped' : rating}</span>
+                              <button
+                                onClick={() => {
+                                  setExpandedSearchItem(isExpanded ? null : item.name);
+                                  setSearchRatingInput('');
+                                }}
+                                className="px-1.5 py-0.5 rounded text-xs text-slate-500 hover:text-slate-300 hover:bg-slate-700 transition-colors"
+                              >
+                                edit
+                              </button>
+                            </div>
+                          ) : !isExpanded ? (
+                            <div className="flex items-center gap-1 shrink-0">
+                              {pred && pred.confidence >= 0.5 && !pred.predictedSkip && (
+                                <button
+                                  onClick={() => handleSearchRate(item.name, pred.rating)}
+                                  className="px-2 py-1 rounded text-xs bg-purple-600/20 text-purple-300 hover:bg-purple-600/40 transition-colors"
+                                >
+                                  {pred.rating}
+                                </button>
+                              )}
+                              <button
+                                onClick={() => {
+                                  setExpandedSearchItem(isExpanded ? null : item.name);
+                                  setSearchRatingInput('');
+                                }}
+                                className="px-2 py-1 rounded text-xs bg-berkeley-gold/20 text-berkeley-gold hover:bg-berkeley-gold/40 transition-colors"
+                              >
+                                Rate
+                              </button>
+                              <button
+                                onClick={() => handleSearchRate(item.name, -1)}
+                                className="px-2 py-1 rounded text-xs bg-red-600/20 text-red-300 hover:bg-red-600/40 transition-colors"
+                              >
+                                Skip
+                              </button>
+                            </div>
+                          ) : null}
+                        </div>
+                        {isExpanded && (
+                          <div className="px-3 pb-2 flex gap-1 items-center">
+                            <div className="flex gap-0.5">
+                              {[1, 2, 3, 4, 5, 6, 7, 8, 9, 10].map((n) => (
+                                <button
+                                  key={n}
+                                  onClick={() => { handleSearchRate(item.name, n); setExpandedSearchItem(null); }}
+                                  className="w-7 h-7 rounded text-xs font-medium bg-[#111827] border border-slate-700 text-slate-400 hover:border-berkeley-gold hover:text-berkeley-gold transition-colors"
+                                >
+                                  {n}
+                                </button>
+                              ))}
+                            </div>
+                            <form onSubmit={(e) => {
+                              e.preventDefault();
+                              const val = parseFloat(searchRatingInput);
+                              if (!isNaN(val) && val >= 1 && val <= 10) {
+                                handleSearchRate(item.name, val);
+                                setExpandedSearchItem(null);
+                              }
+                            }} className="flex gap-1 ml-1">
+                              <input
+                                type="number"
+                                min="1"
+                                max="10"
+                                step="0.5"
+                                value={searchRatingInput}
+                                onChange={(e) => setSearchRatingInput(e.target.value)}
+                                placeholder="0.5"
+                                className="w-12 bg-[#111827] border border-slate-700 rounded px-1 py-1 text-white text-xs text-center placeholder-slate-600 focus:outline-none focus:border-berkeley-gold"
+                              />
+                            </form>
+                          </div>
+                        )}
+                      </div>
+                    );
+                  })}
+                </div>
+              </>
+            )}
+          </div>
+        </div>
+      )}
+
       {/* Loading */}
       {(loading || weekLoading) && (
         <div className="text-center py-20">
@@ -434,6 +834,22 @@ function RatePageContent() {
                   className="text-xs bg-berkeley-blue/50 text-berkeley-gold px-2 py-0.5 rounded-full"
                 >
                   {cat}
+                </span>
+              ))}
+              {currentItem.dietaryChoices.map((diet) => (
+                <span
+                  key={diet}
+                  className="text-xs bg-green-900/40 text-green-300 px-2 py-0.5 rounded-full"
+                >
+                  {diet.replace(' Option', '')}
+                </span>
+              ))}
+              {currentItem.allergens.map((allergen) => (
+                <span
+                  key={allergen}
+                  className="text-xs bg-orange-900/40 text-orange-300 px-2 py-0.5 rounded-full"
+                >
+                  {allergen}
                 </span>
               ))}
             </div>

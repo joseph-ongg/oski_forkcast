@@ -2,9 +2,10 @@
 
 import { useState, useEffect, useCallback, useMemo } from 'react';
 import { useAuth } from './providers';
-import { MenuData, Rankings, HallResult } from '@/lib/types';
+import { MenuData, Rankings, HallResult, DietaryPreferences } from '@/lib/types';
 import { calculateHallScore, getCurrentMealPeriod, resolveActivePeriod, getEarlierMealItems } from '@/lib/scoring';
-import { loadRankings, loadIgnoredCategories } from '@/lib/storage';
+import { loadRankings, loadIgnoredCategories, loadDietaryPreferences } from '@/lib/storage';
+import { getExcludedDishNames, shouldExcludeDish } from '@/lib/dietary';
 import { syncWithCloud } from '@/lib/sync';
 import UserMenu from '@/components/UserMenu';
 import Link from 'next/link';
@@ -91,7 +92,8 @@ function computeResults(
   menus: MenuData[],
   rankings: Rankings,
   mealPeriod: string,
-  ignoredCategories: string[]
+  ignoredCategories: string[],
+  dietaryPrefs?: DietaryPreferences
 ): HallResult[] {
   const ignored = new Set(ignoredCategories.map((c) => c.toLowerCase()));
   const results: HallResult[] = [];
@@ -99,7 +101,14 @@ function computeResults(
     const activePeriod = resolveActivePeriod(menu, mealPeriod);
     if (!activePeriod) continue;
     const earlierItems = getEarlierMealItems(menu, activePeriod);
-    const score = calculateHallScore(menu, rankings, activePeriod, ignored, earlierItems);
+    // Merge earlier-meal exclusions with dietary exclusions
+    const excludeItems = new Set(earlierItems);
+    if (dietaryPrefs && (dietaryPrefs.diets.length > 0 || dietaryPrefs.allergens.length > 0)) {
+      const mealItems = menu.meals[activePeriod] || [];
+      const dietaryExcluded = getExcludedDishNames(mealItems, dietaryPrefs);
+      dietaryExcluded.forEach((name) => excludeItems.add(name));
+    }
+    const score = calculateHallScore(menu, rankings, activePeriod, ignored, excludeItems);
     results.push({ location: menu.location, score, activePeriod });
   }
   results.sort((a, b) => b.score.total_score - a.score.total_score);
@@ -107,6 +116,23 @@ function computeResults(
 }
 
 export default function DashboardPage() {
+  const [mounted, setMounted] = useState(false);
+  useEffect(() => { setMounted(true); }, []);
+
+  if (!mounted) {
+    return (
+      <main className="max-w-2xl mx-auto px-4 py-6">
+        <div className="text-center py-20">
+          <p className="text-slate-400">Loading...</p>
+        </div>
+      </main>
+    );
+  }
+
+  return <DashboardContent />;
+}
+
+function DashboardContent() {
   const { user } = useAuth();
   const [menus, setMenus] = useState<MenuData[]>([]);
   const [rankings, setRankings] = useState<Rankings>({});
@@ -116,6 +142,7 @@ export default function DashboardPage() {
   const [error, setError] = useState<string | null>(null);
   const [hallResults, setHallResults] = useState<HallResult[]>([]);
   const [ignoredCategories, setIgnoredCategories] = useState<string[]>([]);
+  const [dietaryPrefs, setDietaryPrefs] = useState<DietaryPreferences>({ diets: [], allergens: [] });
   const [showPlanner, setShowPlanner] = useState(false);
   const [plannerData, setPlannerData] = useState<DayPlan[]>([]);
   const [plannerLoading, setPlannerLoading] = useState(false);
@@ -143,15 +170,18 @@ export default function DashboardPage() {
         .then(({ rankings: r, ignoredCategories: ic }) => {
           setRankings(r);
           setIgnoredCategories(ic);
+          setDietaryPrefs(loadDietaryPreferences());
         })
         .catch(() => {
           // Fallback to localStorage on sync failure
           setRankings(loadRankings());
           setIgnoredCategories(loadIgnoredCategories());
+          setDietaryPrefs(loadDietaryPreferences());
         });
     } else {
       setRankings(loadRankings());
       setIgnoredCategories(loadIgnoredCategories());
+      setDietaryPrefs(loadDietaryPreferences());
     }
   }, [user]);
 
@@ -169,18 +199,20 @@ export default function DashboardPage() {
       setHallResults([]);
       return;
     }
-    setHallResults(computeResults(menus, rankings, mealPeriod, ignoredCategories));
-  }, [menus, rankings, mealPeriod, ignoredCategories]);
+    setHallResults(computeResults(menus, rankings, mealPeriod, ignoredCategories, dietaryPrefs));
+  }, [menus, rankings, mealPeriod, ignoredCategories, dietaryPrefs]);
 
   useEffect(() => {
     const onStorage = () => {
       setRankings(loadRankings());
       setIgnoredCategories(loadIgnoredCategories());
+      setDietaryPrefs(loadDietaryPreferences());
     };
     window.addEventListener('storage', onStorage);
     const onFocus = () => {
       setRankings(loadRankings());
       setIgnoredCategories(loadIgnoredCategories());
+      setDietaryPrefs(loadDietaryPreferences());
     };
     window.addEventListener('focus', onFocus);
     return () => {
@@ -223,10 +255,11 @@ export default function DashboardPage() {
 
     const currentRankings = loadRankings();
     const currentIgnored = loadIgnoredCategories();
+    const currentDietary = loadDietaryPreferences();
 
     const updatedDays = days.map((day) => {
       const dayMenus = menuCache[day.dateStr] || [];
-      const results = computeResults(dayMenus, currentRankings, day.mealPeriod, currentIgnored);
+      const results = computeResults(dayMenus, currentRankings, day.mealPeriod, currentIgnored, currentDietary);
       return { ...day, results, loading: false };
     });
 
@@ -251,6 +284,7 @@ export default function DashboardPage() {
       if (!period || !menu.meals[period]) continue;
       for (const item of menu.meals[period]) {
         if (ignoredLower.has(item.category.toLowerCase())) continue;
+        if (shouldExcludeDish(item, dietaryPrefs)) continue;
         itemNames.add(item.name);
       }
     }
@@ -259,7 +293,7 @@ export default function DashboardPage() {
       if (!(name in rankings)) unrated++;
     });
     return unrated;
-  }, [menus, rankings, mealPeriod, ignoredCategories]);
+  }, [menus, rankings, mealPeriod, ignoredCategories, dietaryPrefs]);
 
   return (
     <main className="max-w-2xl mx-auto px-4 py-6">
